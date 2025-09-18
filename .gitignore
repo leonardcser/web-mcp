@@ -1,0 +1,4 @@
+.cache.bbolt
+web-mcp
+web-mcp-cache
+web-mcp.log
