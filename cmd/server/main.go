@@ -66,7 +66,7 @@ func main() {
 	)
 	logger.Infof("Created MCP server instance")
 
-	toolFetch := mcp.NewTool("Web Fetch",
+	toolFetch := mcp.NewTool("web-fetch",
 		mcp.WithDescription(multiline(
 			"Fetches content from a specified URL and returns the parsed content",
 			"\nFunctionality:",
@@ -86,7 +86,7 @@ func main() {
 	s.AddTool(toolFetch, tools.WebFetchHandler(fetcher))
 	logger.Infof("Registered web-fetch tool")
 
-	toolSearch := mcp.NewTool("Web Search",
+	toolSearch := mcp.NewTool("web-search",
 		mcp.WithDescription(multiline(
 			"Allows you to search the web and use the results to inform responses",
 			"\nFunctionality:",
