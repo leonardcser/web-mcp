@@ -47,10 +47,6 @@ Run the server:
 To use this server with Claude Desktop or other MCP clients, add it to your MCP
 configuration file.
 
-### Claude Desktop Configuration
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
 ```json
 {
   "mcpServers": {
