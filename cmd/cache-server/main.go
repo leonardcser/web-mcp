@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 func main() {
 	sock := defaultString(os.Getenv("WEB_MCP_CACHE_SOCK"), defaultSocketPath())
 	db := defaultString(os.Getenv("WEB_MCP_CACHE_DB"), defaultDBPath())
+	_ = os.MkdirAll(filepath.Dir(db), 0o755)
 
 	// Ensure socket dir exists and remove stale socket
 	_ = os.MkdirAll(filepath.Dir(sock), 0o755)
@@ -20,14 +22,14 @@ func main() {
 
 	l, err := net.Listen("unix", sock)
 	if err != nil {
-		panic(err)
+		log.Fatal("failed to listen on unix socket: ", err)
 	}
 	defer l.Close()
 	_ = os.Chmod(sock, 0o600)
 
 	store, err := cache.Open(db, cache.Options{Bucket: "web", DefaultTTL: 15 * time.Minute})
 	if err != nil {
-		panic(err)
+		log.Fatal("failed to open cache database: ", err)
 	}
 	defer store.Close()
 
