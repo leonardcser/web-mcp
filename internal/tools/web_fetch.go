@@ -12,12 +12,15 @@ import (
 // WebFetchHandler returns the MCP tool handler for the "web-fetch" tool.
 func WebFetchHandler(fetcher *web.Fetcher) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if ctx.Err() != nil {
+			return mcp.NewToolResultError(ctx.Err().Error()), nil
+		}
 		url, err := req.RequireString("url")
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		ps, err := fetcher.Fetch(url)
+		ps, err := fetcher.Fetch(ctx, url)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -30,22 +33,24 @@ func WebFetchHandler(fetcher *web.Fetcher) func(context.Context, mcp.CallToolReq
 
 func formatPageSummary(ps *web.PageSummary) string {
 	var sb strings.Builder
-	sb.WriteString("Page Content:\n")
-	sb.WriteString("=============\n\n")
-	sb.WriteString("Title: ")
-	sb.WriteString(ps.Title)
-	sb.WriteString("\n\nDescription: ")
-	sb.WriteString(ps.Description)
-	sb.WriteString("\n\nURL: ")
-	sb.WriteString(ps.URL)
-	sb.WriteString("\n\nLinks found on the page:\n")
-	for _, l := range ps.Links {
-		sb.WriteString("- ")
-		sb.WriteString(l)
+	if ps.Title != "" {
+		sb.WriteString("# ")
+		sb.WriteString(ps.Title)
+		sb.WriteString("\n\n")
+	}
+	if ps.Description != "" {
+		sb.WriteString(ps.Description)
+		sb.WriteString("\n\n")
+	}
+	if len(ps.Links) > 0 {
+		sb.WriteString("## Links\n")
+		for _, l := range ps.Links {
+			sb.WriteString("- ")
+			sb.WriteString(l)
+			sb.WriteString("\n")
+		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString("\nFull Text Content:\n")
-	sb.WriteString("==================\n")
 	sb.WriteString(ps.Text)
 	return sb.String()
 }

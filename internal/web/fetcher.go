@@ -2,15 +2,23 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/JohannesKaufmann/html-to-markdown/v2"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
 	"github.com/leonardcser/web-mcp/internal/cache"
+)
+
+const (
+	RequestTimeout  = 20 * time.Second
+	MaxResponseSize = 1 * 1024 * 1024 // 1MB
 )
 
 type PageSummary struct {
@@ -32,7 +40,12 @@ func NewFetcher(cacheStore cache.KV, ttl time.Duration) *Fetcher {
 		colly.AllowURLRevisit(),
 		colly.Async(false),
 	)
-	c.SetRequestTimeout(20 * time.Second)
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 1,
+		Delay:       1 * time.Second,
+	})
+	c.SetRequestTimeout(RequestTimeout)
 	c.OnRequest(func(r *colly.Request) {
 		r.Headers.Set("User-Agent", NextUserAgent())
 		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -43,7 +56,13 @@ func NewFetcher(cacheStore cache.KV, ttl time.Duration) *Fetcher {
 
 func (f *Fetcher) cacheKey(rawURL string) string { return "web_fetch|" + rawURL }
 
-func (f *Fetcher) Fetch(rawURL string) (*PageSummary, error) {
+func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*PageSummary, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		return nil, errors.New("url must start with http:// or https://")
 	}
@@ -57,9 +76,19 @@ func (f *Fetcher) Fetch(rawURL string) (*PageSummary, error) {
 	var finalURL string
 	var fetchErr error
 
+	var contentType string
+
+	originalCtx := f.c.Context
+	f.c.Context = ctx
+	defer func() { f.c.Context = originalCtx }()
+
 	f.c.OnResponse(func(r *colly.Response) {
+		if ctx.Err() != nil {
+			return
+		}
 		finalURL = r.Request.URL.String()
 		pageHTML = append([]byte(nil), r.Body...)
+		contentType = r.Headers.Get("Content-Type")
 	})
 
 	fetchErr = f.c.Visit(rawURL)
@@ -67,46 +96,110 @@ func (f *Fetcher) Fetch(rawURL string) (*PageSummary, error) {
 		return nil, fetchErr
 	}
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	if len(pageHTML) == 0 {
 		return nil, errors.New("empty response body")
 	}
 
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageHTML))
-	if err != nil {
-		return nil, err
+	if len(pageHTML) > MaxResponseSize {
+		pageHTML = pageHTML[:MaxResponseSize]
+		pageHTML = append(pageHTML, []byte("... [response trimmed due to size]")...)
 	}
 
-	// Remove non-visible elements
-	doc.Find("script, style, noscript, iframe").Each(func(i int, s *goquery.Selection) { s.Remove() })
+	lowerCT := strings.ToLower(contentType)
+	isHTML := strings.Contains(lowerCT, "text/html")
+	isText := strings.HasPrefix(lowerCT, "text/")
 
-	title := strings.TrimSpace(doc.Find("head > title").First().Text())
-	desc := strings.TrimSpace(doc.Find("meta[name=description]").AttrOr("content", ""))
+	if !isText {
+		return nil, errors.New("unsupported content type: binary files like images or PDFs are not supported")
+	}
 
-	// Extract text
-	bodyText := strings.TrimSpace(doc.Find("body").Text())
-	bodyText = strings.Join(strings.Fields(bodyText), " ")
+	var title, desc, bodyText string
+	var links []string
 
-	// Extract absolute links
-	base, _ := url.Parse(finalURL)
-	linkSet := make(map[string]struct{})
-	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
-		href := strings.TrimSpace(s.AttrOr("href", ""))
-		if href == "" || strings.HasPrefix(href, "javascript:") {
-			return
-		}
-		u, err := url.Parse(href)
+	if isHTML {
+		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageHTML))
 		if err != nil {
-			return
+			return nil, err
 		}
-		if !u.IsAbs() && base != nil {
-			u = base.ResolveReference(u)
+
+		// Remove non-visible elements
+		doc.Find("script, style, noscript, iframe, object, embed, img, video, picture, svg, canvas, audio, source, track, map, area, form, label, input, button, select, textarea, progress, ins, applet").Remove()
+
+		title = strings.TrimSpace(doc.Find("head > title").First().Text())
+		desc = strings.TrimSpace(doc.Find("meta[name=description]").AttrOr("content", ""))
+
+		plainText := strings.TrimSpace(doc.Find("body").Text())
+		plainText = strings.Join(strings.Fields(plainText), " ")
+
+		// Extract absolute links with filtering and deduplication
+		base, _ := url.Parse(finalURL)
+		linkSet := make(map[string]struct{})
+		doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+			href := strings.TrimSpace(s.AttrOr("href", ""))
+			if href == "" || strings.HasPrefix(href, "javascript:") {
+				return
+			}
+			u, err := url.Parse(href)
+			if err != nil {
+				return
+			}
+			if !u.IsAbs() && base != nil {
+				u = base.ResolveReference(u)
+			}
+			abs := u.String()
+			linkSet[abs] = struct{}{}
+		})
+
+		// Filter, dedupe canonical, exclude unwanted schemes, remove fragments, limit to 50
+		canonicalSet := make(map[string]struct{})
+		for abs := range linkSet {
+			u, err := url.Parse(abs)
+			if err != nil {
+				continue
+			}
+			// Exclude unwanted schemes
+			if u.Scheme == "javascript" || u.Scheme == "mailto" || u.Scheme == "tel" || u.Scheme == "" {
+				continue
+			}
+			// Remove fragment
+			u.Fragment = ""
+			canon := u.String()
+			canonicalSet[canon] = struct{}{}
 		}
-		abs := u.String()
-		linkSet[abs] = struct{}{}
-	})
-	links := make([]string, 0, len(linkSet))
-	for l := range linkSet {
-		links = append(links, l)
+
+		links = make([]string, 0, len(canonicalSet))
+		for canon := range canonicalSet {
+			links = append(links, canon)
+			if len(links) >= 50 {
+				break
+			}
+		}
+		sort.Strings(links)
+
+		// Remove &lt;a&gt; elements after extracting links
+		doc.Find("a").Remove()
+
+		// Remove header and footer
+		doc.Find("header, footer, aside").Remove()
+
+		// Convert to Markdown
+		htmlStr, err := doc.Html()
+		if err != nil {
+			return nil, err
+		}
+
+		markdown, err := htmltomarkdown.ConvertString(string(htmlStr))
+		if err != nil {
+			bodyText = plainText
+		} else {
+			bodyText = markdown
+		}
+	} else {
+		bodyText = string(pageHTML)
 	}
 
 	ps := &PageSummary{
